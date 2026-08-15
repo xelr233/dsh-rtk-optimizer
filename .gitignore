@@ -3,3 +3,4 @@ node_modules/
 .dsh/
 test/fixtures/
 .codegraph/
+.worktrees/
