@@ -2,3 +2,4 @@ node_modules/
 .dsh-hashline-state.json
 .dsh/
 test/fixtures/
+.codegraph/
