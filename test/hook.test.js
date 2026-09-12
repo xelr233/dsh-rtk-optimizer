@@ -15,11 +15,44 @@ const hostBody = fs.readFileSync(hostPath, 'utf8')
  * opts.spawnResult: { outcome, stdout, stderr } | Function(spec) → same — what
  *   each spawn returns. Default: exit 0 with empty stdout/stderr.
  * opts.probe: resolveExecutable impl (default: resolves to '/usr/local/bin/rtk').
+ * opts.shellResult: { exitCode, signal, stdout, stderr, sandbox, … } | Function(spec) —
+ *   what the shell seam returns for the rewritten command (default: exit 0, empty).
  */
 function mount(opts = {}) {
   const spawnLog = opts.spawnLog ?? []
   const handlers = {}
   const plugin = new Function(hostBody)()
+  // Hook-mode execution now goes through the shell seam (`ctx.shell`), which is
+  // where the deployment's real shell (Bash, Git Bash, pwsh) and its sandbox
+  // live. The fake records every resolved spec so tests can assert the rewrite
+  // reached the executor and carried the resolved policy.
+  const shellLog = []
+  const fakeShell = {
+    resolve: (request) => ({
+      command: request.command,
+      workdir: request.workdir,
+      timeoutMs: request.timeoutMs,
+      ...(request.sandboxPolicy !== undefined ? { sandboxPolicy: request.sandboxPolicy } : {}),
+      signal: request.signal
+    }),
+    run: async (spec) => {
+      shellLog.push({ spec })
+      const r = typeof opts.shellResult === 'function' ? opts.shellResult(spec) : opts.shellResult
+      if (r && typeof r.then === 'function') return r
+      // `??` would swallow a deliberate `exitCode: null` / custom signal that a
+      // timeout case sets, so presence is tested instead of nullishness.
+      return {
+        exitCode: r && 'exitCode' in r ? r.exitCode : 0,
+        signal: r && 'signal' in r ? r.signal : null,
+        timedOut: r?.timedOut ?? false,
+        aborted: r?.aborted ?? false,
+        timeoutMs: (r && 'timeoutMs' in r ? r.timeoutMs : undefined) ?? spec.timeoutMs ?? 120000,
+        stdout: { text: r?.stdout ?? '', truncated: false, ...(r?.stdoutSpill !== undefined ? { spillPath: r.stdoutSpill } : {}) },
+        stderr: { text: r?.stderr ?? '', truncated: false, ...(r?.stderrSpill !== undefined ? { spillPath: r.stderrSpill } : {}) },
+        ...(r?.sandbox !== undefined ? { sandbox: r.sandbox } : {})
+      }
+    }
+  }
   const fakeSpawn = (spec) => {
     spawnLog.push({ spec })
     const r = typeof opts.spawnResult === 'function' ? opts.spawnResult(spec) : opts.spawnResult
@@ -64,6 +97,12 @@ function mount(opts = {}) {
       }
       if (name === 'timer') return { timeout: () => Promise.resolve() }
       if (name === 'commands') return { register: (def) => { handlers.command = def.handler } }
+      if (name === 'shell') return fakeShell
+      if (name === 'sandboxPolicy') {
+        return opts.sandboxPolicy === undefined
+          ? { resolve: () => opts.resolvedPolicy ?? { mode: 'workspace-write', workspaceRoot: '/home/yjw/workspace/dsh-rtk-optimizer' } }
+          : opts.sandboxPolicy
+      }
       if (name === 'fs' && opts.fs) return opts.fs
       return undefined
     },
@@ -76,6 +115,7 @@ function mount(opts = {}) {
     handlers,
     runCommand: (rawInput) => handlers.command({ rawInput }),
     spawnLog,
+    shellLog,
     // helpers to build exec-like objects for pipeline handlers
     makeExec: (callId, command, extra = {}) => ({
       callId,
@@ -188,13 +228,11 @@ test('hook mode execute short-circuits with a foreground value running the rewri
   const spawnLog = []
   const t = mount({
     spawnLog,
-    spawnResult: (spec) => {
-      if (spec.argv[1] === 'hook') {
-        return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls -la' } } }) }
-      }
-      // the rewritten command execution
-      return { outcome: { exitCode: 0, signal: null }, stdout: 'file1\nfile2\n', stderr: '' }
-    }
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls -la' } } })
+    },
+    shellResult: { exitCode: 0, stdout: 'file1\nfile2\n' }
   })
   await t.runCommand('set mode hook')
   await pre(t, 'call-exec-1', 'ls -la')
@@ -205,11 +243,56 @@ test('hook mode execute short-circuits with a foreground value running the rewri
   assert.equal(value.kind, 'foreground')
   assert.equal(value.exitCode, 0)
   assert.equal(value.stdout.text, 'file1\nfile2\n')
-  // the rewritten command is run via bash -c
-  const execSpawn = spawnLog.find((e) => e.spec.argv[1] === '-c')
-  assert.ok(execSpawn, 'must spawn a shell for the rewritten command')
-  assert.equal(execSpawn.spec.argv[0], '/bin/bash')
-  assert.equal(execSpawn.spec.argv[2], 'rtk ls -la')
+  // the rewritten command goes through the shell seam, not a spawn of its own
+  assert.equal(t.shellLog.length, 1, 'exactly one shell.run for the rewritten command')
+  assert.equal(t.shellLog[0].spec.command, 'rtk ls -la')
+  assert.equal(spawnLog.length, 1, 'the only subprocess spawn is `rtk hook claude`')
+  assert.equal(spawnLog[0].spec.argv[1], 'hook')
+})
+
+test('hook mode execute resolves and forwards the session sandbox policy to the shell seam', async () => {
+  const policy = { mode: 'workspace-write', workspaceRoot: '/home/yjw/workspace/dsh-rtk-optimizer' }
+  const t = mount({
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } })
+    },
+    resolvedPolicy: policy
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-policy', 'ls')
+  await exec(t, 'call-policy', 'ls')
+  assert.equal(t.shellLog.length, 1)
+  // An executor that confines refuses a spec without a policy, so the resolved
+  // one must travel with the request instead of being left to default.
+  assert.deepEqual(t.shellLog[0].spec.sandboxPolicy, policy)
+})
+
+test('hook mode execute runs the rewritten command in the session cwd', async () => {
+  const t = mount({
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } })
+    }
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-cwd', 'ls')
+  await exec(t, 'call-cwd', 'ls')
+  assert.equal(t.shellLog[0].spec.workdir, '/home/yjw/workspace/dsh-rtk-optimizer')
+})
+
+test('hook mode execute passes through the executor sandbox verdict', async () => {
+  const t = mount({
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } })
+    },
+    shellResult: { exitCode: 1, sandbox: { mode: 'workspace-write', denied: true, enforcement: 'partial' } }
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-deny', 'ls')
+  const { out } = await exec(t, 'call-deny', 'ls')
+  assert.deepEqual(out.value.sandbox, { mode: 'workspace-write', denied: true, enforcement: 'partial' })
 })
 
 test('hook mode execute falls through to next() when no plan exists', async () => {
@@ -222,33 +305,34 @@ test('hook mode execute falls through to next() when no plan exists', async () =
   assert.equal(spawnLog.length, 0, 'no spawn when no plan')
 })
 
-test('hook mode execute falls through to next() when the rewritten spawn throws', async () => {
+test('hook mode execute falls through to next() when the shell seam rejects', async () => {
   const t = mount({
-    spawnResult: (spec) => {
-      if (spec.argv[1] === '-c') throw new Error('boom')
-      return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } }) }
-    }
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } })
+    },
+    shellResult: () => { throw new Error('boom') }
   })
   await t.runCommand('set mode hook')
   await pre(t, 'call-throw', 'ls')
   const { out, nextCalled } = await exec(t, 'call-throw', 'ls')
-  assert.equal(nextCalled, true, 'spawn failure must fall through to original command')
+  assert.equal(nextCalled, true, 'executor failure must fall through to the original command')
   assert.equal(out.kind, 'next')
 })
 
-test('hook mode execute returns timedOut result (no fallthrough) when the rewritten spawn times out', async () => {
+test('hook mode execute surfaces the executor timeout without falling through', async () => {
   const t = mount({
-    spawnResult: (spec) => {
-      if (spec.argv[1] === '-c') {
-        return new Promise(() => {}) // never settles; timer fires first
-      }
-      return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } }) }
-    }
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } })
+    },
+    // The executor owns the deadline; a timed-out run settles as timedOut.
+    shellResult: { timedOut: true, exitCode: null, signal: 'SIGTERM' }
   })
   await t.runCommand('set mode hook')
   await pre(t, 'call-timeout', 'ls')
   const { out, nextCalled } = await exec(t, 'call-timeout', 'ls')
-  assert.equal(nextCalled, false, 'timeout must NOT fall through (original may have run partially)')
+  assert.equal(nextCalled, false, 'timeout must NOT fall through (the command may have run partially)')
   assert.equal(out.value.timedOut, true)
   assert.equal(out.value.exitCode, null)
 })
@@ -397,18 +481,17 @@ test('hook mode post-execute clears a planned-but-not-executed hookPlan entry', 
 
 test('hook mode execute propagates spillPath from the rewritten stdout/stderr streams', async () => {
   const t = mount({
-    spawnResult: (spec) => {
-      if (spec.argv[1] === 'hook') {
-        return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls big' } } }) }
-      }
-      // rewritten command execution spills both streams
-      return {
-        outcome: { exitCode: 0, signal: null },
-        stdout: 'big output\n',
-        stdoutSpill: '/tmp/spilled-stdout.log',
-        stderr: 'err\n',
-        stderrSpill: '/tmp/spilled-stderr.log'
-      }
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls big' } } })
+    },
+    // rewritten command execution spills both streams
+    shellResult: {
+      exitCode: 0,
+      stdout: 'big output\n',
+      stdoutSpill: '/tmp/spilled-stdout.log',
+      stderr: 'err\n',
+      stderrSpill: '/tmp/spilled-stderr.log'
     }
   })
   await t.runCommand('set mode hook')

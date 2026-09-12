@@ -18,6 +18,10 @@
 //   • tools/post-execute — compact noisy successful output of bash / grep /
 //     read (config-gated) through a pipeline: ANSI strip, git compaction,
 //     search grouping, test aggregation, build filtering, smart truncation.
+//   • tools/execute      — hook mode replaces the call with the rtk-rewritten
+//     command, executed through the mounted shell seam (`ctx.shell`) so the
+//     deployment's own shell (Bash, Git Bash, pwsh, …) and its sandbox policy
+//     are honored — never a hardcoded shell path.
 //   • /rtk command        — show config & runtime status, verify the rtk
 //     binary, and show/clear compaction stats.
 // ============================================================================
@@ -295,11 +299,17 @@ return {
   // Hard dependencies so cordis parks this plugin until the services exist
   // (static mount: bundle rows load in parallel; without this, apply() could
   // run before subprocess/commands/timer are mounted and silently degrade).
-  inject: ['subprocess', 'commands', 'timer'],
+  // `shell` is the deployment's shell seam (Bash, Git Bash, pwsh, …) and
+  // `sandboxPolicy` resolves each call's confinement. Both are required by
+  // hook mode's execution: routing through them is what makes the rewrite work
+  // on every platform and keeps the sandbox semantics intact.
+  inject: ['subprocess', 'commands', 'timer', 'shell', 'sandboxPolicy'],
   apply(ctx, injected) {
     const subprocess = ctx.get('subprocess')
     const commands = ctx.get('commands')
     const timer = ctx.get('timer')
+    const shell = ctx.get('shell')
+    const sandboxPolicy = ctx.get('sandboxPolicy')
     const fs = ctx.get('fs')
     const config = {
       ...DEFAULT_CONFIG,
@@ -609,52 +619,45 @@ return {
         ? exec.arguments.timeoutMs
         : 120000
       try {
-        const handle = subprocess.spawn({
-          argv: ['/bin/bash', '-c', rewritten],
-          cwd,
-          stdio: {
-            stdin: 'ignore',
-            stdout: { maxBytes: 1000000, spill: { maxBytes: 10000000 } },
-            stderr: { maxBytes: 100000, spill: { maxBytes: 1000000 } }
-          },
-          graceMs: 300,
+        // Run the rewritten command through the deployment's shell seam rather
+        // than a hardcoded shell path. The executor behind `ctx.shell` owns the
+        // shell itself (Bash, Git Bash with its --login/CHERE_INVOKING handling,
+        // pwsh, …), the privilege boundary, and the output budgets — spawning
+        // `/bin/bash` directly both failed on Windows (ENOENT) and bypassed the
+        // sandbox. The policy is resolved per call exactly as the bash tool does:
+        // an executor that confines refuses a spec without one.
+        const policy = sandboxPolicy !== undefined
+          ? sandboxPolicy.resolve(exec.agent !== undefined ? { session: exec.agent.session } : {})
+          : undefined
+        const spec = shell.resolve({
+          command: rewritten,
+          workdir: cwd,
+          timeoutMs,
+          ...(policy !== undefined ? { sandboxPolicy: policy } : {}),
           signal: exec.signal
         })
-        let outcome
-        if (timer !== undefined) {
-          outcome = await Promise.race([
-            handle.done,
-            timer.timeout(timeoutMs).then(() => { handle.terminate(); return undefined })
-          ])
-        } else {
-          outcome = await handle.done
-        }
-        const readStream = async (reader) => {
-          if (!reader) return { text: '', truncated: false }
-          const read = await reader.readFrom(0)
-          return {
-            text: read.text,
-            truncated: read.lossy === true,
-            ...(read.spillPath !== undefined ? { spillPath: read.spillPath } : {})
-          }
-        }
-        const stdout = await readStream(handle.collected && handle.collected.stdout)
-        const stderr = await readStream(handle.collected && handle.collected.stderr)
-        const timedOut = outcome === undefined
+        const outcome = await shell.run(spec)
         state.hookExecuted.set(exec.callId, rewritten)
         capMap(state.hookExecuted)
-        return {
-          value: {
-            kind: 'foreground',
-            exitCode: timedOut ? null : outcome.exitCode,
-            signal: timedOut ? 'SIGTERM' : outcome.signal,
-            timedOut,
-            aborted: exec.signal && exec.signal.aborted === true,
-            timeoutMs,
-            stdout,
-            stderr
+        const value = {
+          kind: 'foreground',
+          exitCode: outcome.exitCode,
+          signal: outcome.signal,
+          timedOut: outcome.timedOut,
+          aborted: outcome.aborted,
+          timeoutMs: outcome.timeoutMs,
+          stdout: outcome.stdout,
+          stderr: outcome.stderr
+        }
+        if (outcome.sandbox !== undefined) {
+          value.sandbox = {
+            mode: outcome.sandbox.mode,
+            denied: outcome.sandbox.denied,
+            ...(outcome.sandbox.enforcement !== undefined ? { enforcement: outcome.sandbox.enforcement } : {}),
+            ...(outcome.sandbox.runnerFailed !== undefined ? { runnerFailed: outcome.sandbox.runnerFailed } : {})
           }
         }
+        return { value }
       } catch (e) {
         if (config.debug) console.error(`dsh-rtk-optimizer: hook execute threw: ${errText(e)}`)
         return next()
