@@ -69,7 +69,7 @@ test('compactGitOutput passes through non-git output unchanged', () => {
 })
 
 // ── search grouping ───────────────────────────────────────────────────────
-test('groupSearchOutput groups grep rows by file', () => {
+test('groupSearchOutput groups grep rows by file (Pi single-line)', () => {
   const input = [
     'src/a.js:3:foo',
     'src/a.js:7:foo',
@@ -81,6 +81,35 @@ test('groupSearchOutput groups grep rows by file', () => {
   assert.match(out, /src\/b\.ts \(1 match\)/)
   assert.match(out, /3: foo/)
   assert.ok(out.includes('(no matches in ignored files)'))
+})
+
+test('groupSearchOutput groups DSH grep blocks by file (path once + many Line rows)', () => {
+  const input = [
+    'Found 3 matches',
+    '',
+    'src\\host.js',
+    'Line 100: const SEARCH_ROW_RE',
+    'Line 249: if (oc.groupSearchOutput',
+    'test\\core.test.js',
+    'Line 72: test(...)'
+  ].join('\n')
+  const out = groupSearchOutput(input)
+  assert.match(out, /src\\host\.js \(2 matches\)/)
+  assert.match(out, /test\\core\.test\.js \(1 match\)/)
+  assert.match(out, /100: const SEARCH_ROW_RE/)
+  assert.match(out, /249: if \(oc\.groupSearchOutput/)
+  assert.match(out, /Found 3 matches/)
+})
+
+test('groupSearchOutput splits Windows drive-letter single-line paths', () => {
+  const input = 'C:\\src\\a.js:5:foo\nC:\\src\\a.js:9:bar\n'
+  const out = groupSearchOutput(input)
+  assert.match(out, /C:\\src\\a\.js \(2 matches\)/)
+})
+
+test('groupSearchOutput leaves non-grep prose alone (two-line guard)', () => {
+  const input = 'line one\nLine 42: this is prose, not a search hit\n'
+  assert.equal(groupSearchOutput(input), input)
 })
 
 test('groupSearchOutput returns input unchanged when nothing groups', () => {
@@ -175,6 +204,27 @@ test('compactOutput groups grep output', () => {
   const { text } = compactOutput('grep', input, cfg)
   assert.match(text, /a\.txt \(2 matches\)/)
   assert.match(text, /b\.txt \(1 match\)/)
+})
+
+test('compactOutput groups DSH grep output (multi-row block)', () => {
+  const cfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG))
+  const input = 'src\\a.js\nLine 3: foo\nLine 7: foo\n'
+  const { text } = compactOutput('grep', input, cfg)
+  assert.match(text, /src\\a\.js \(2 matches\)/)
+  assert.match(text, /3: foo/)
+  assert.match(text, /7: foo/)
+})
+
+test('compactOutput applies git/build compaction to pwsh output', () => {
+  const cfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG))
+  const gitInput = ' M a.js\n M b.js\n?? c.js\n'
+  const git = compactOutput('pwsh', gitInput, cfg, 'git status --short')
+  assert.match(git.text, /git status summary/)
+  const buildInput = 'compiling...\nsrc/x.ts:1: error TS2322: bad\ndone\n'
+  const build = compactOutput('pwsh', buildInput, cfg, 'pnpm build')
+  assert.match(build.text, /build output filtered/)
+  const plain = compactOutput('pwsh', 'hello\n', cfg)
+  assert.equal(plain.text, 'hello\n')
 })
 
 test('compactOutput read compaction is off by default', () => {

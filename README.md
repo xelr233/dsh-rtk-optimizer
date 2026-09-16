@@ -35,7 +35,7 @@ RTK 命令改写建议 + 工具输出压缩——DSH 插件（Host 拦截器）�
 
 ### 2. 输出压缩（`tools/post-execute`）
 
-对成功返回的 `bash`/`grep`/`read` 文本输出按配置走压缩管线（可单独开关）：
+对成功返回的 `bash`/`pwsh`/`grep`/`read` 文本输出按配置走压缩管线（可单独开关）：
 
 | 阶段 | 说明 |
 |---|---|
@@ -43,7 +43,7 @@ RTK 命令改写建议 + 工具输出压缩——DSH 插件（Host 拦截器）�
 | Git 压缩 | `git status --short` 行汇总为一行统计；40 位 commit hash 缩短为 7 位 |
 | 测试聚合 | 保留 `Tests: N passed, M failed` 总结与失败行，折叠其余（jest/mocha/vitest/go test/pytest 命令触发） |
 | 构建过滤 | 只保留 error/warning 行 + 汇总统计（build/tsc/make/npm 等命令触发） |
-| 搜索分组 | `path:line:content` 行按文件分组（`grep` 工具输出） |
+| 搜索分组 | 按文件分组 `grep` 输出——兼容 Pi 单行 `path:line:content` 与 DSH 两行 `path` + `Line N: content` 两种格式 |
 | 智能截断 | 超 `maxOutputChars`（默认 30000）时保留头 + 尾，中间打截断标记 |
 
 统计每个调用的节省字符数，`/rtk stats` 可查。
@@ -76,12 +76,12 @@ override 块，默认路径 `~/.dsh/profiles/web/cordis.patch.yml`；可通过�
 dsh plugin --profile <name> add dsh-rtk-optimizer
 ```
 
-安装后重启 DSH，压缩与改写对全部会话的 `bash`/`grep`/`read` 调用生效（`/rtk` 命令可查状态与统计）。
+安装后重启 DSH，压缩与改写对全部会话的 `bash`/`pwsh`/`grep`/`read` 调用生效（`/rtk` 命令可查状态与统计）。
 
 ## 开发
 
 ```bash
-npm test   # 20 用例：ANSI、git 压缩、搜索分组、测试聚合、构建过滤、截断、总管线、静态求值
+npm test   # 54 用例：ANSI、git 压缩、搜索分组、测试聚合、构建过滤、截断、总管线、静态求值
 ```
 
 ## 参考
