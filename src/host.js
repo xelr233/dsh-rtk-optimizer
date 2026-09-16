@@ -97,11 +97,16 @@ function compactGitOutput(text) {
   return out.join('\n')
 }
 
-const SEARCH_ROW_RE = /^([^:]+):(\d+):(.*)$/
+const SEARCH_ROW_RE = /^(.+?):(\d+):(.*)$/
+const DSH_SEARCH_LINE_RE = /^Line (\d+): (.*)$/
 
 /**
- * Group grep/rg-style `path:line:content` rows by file. Rows that do not
- * match the pattern pass through unchanged.
+ * Group search rows by file. Supports two output shapes:
+ *  - Pi/grep single-line: `path:line:content` (lazy path so Windows
+ *    drive letters like `C:\src\a.js:5:foo` still split correctly)
+ *  - DSH grep block:      a bare `path` line followed by one or more
+ *    `Line N: content` rows — the shape DSH's own grep tool emits.
+ * Rows that match neither shape pass through unchanged.
  */
 function groupSearchOutput(text) {
   const lines = text.split('\n')
@@ -109,20 +114,46 @@ function groupSearchOutput(text) {
   const groups = new Map() // path → { count, rows: [{line, content}] }
   const order = []
   const passthrough = []
-  for (const line of lines) {
-    const m = line.match(SEARCH_ROW_RE)
-    if (m && !/^\/\//.test(m[1])) {
-      let g = groups.get(m[1])
-      if (!g) {
-        g = { count: 0, rows: [] }
-        groups.set(m[1], g)
-        order.push(m[1])
-      }
-      g.count++
-      if (g.rows.length < 50) g.rows.push({ line: m[2], content: m[3] })
-    } else {
-      passthrough.push(line)
+  let currentPath = null
+  const isPathLike = (line) =>
+    /^[A-Za-z]:[\\/]/.test(line) || /[/\\]/.test(line) || /\.\w+$/.test(line)
+  const addRow = (path, line, content) => {
+    if (/^\/\//.test(path)) return false
+    let g = groups.get(path)
+    if (!g) {
+      g = { count: 0, rows: [] }
+      groups.set(path, g)
+      order.push(path)
     }
+    g.count++
+    if (g.rows.length < 50) g.rows.push({ line, content })
+    return true
+  }
+  for (const line of lines) {
+    // Inside a DSH block: consecutive `Line N: content` rows keep the path.
+    if (currentPath !== null) {
+      const m = line.match(DSH_SEARCH_LINE_RE)
+      if (m) {
+        addRow(currentPath, m[1], m[2])
+        continue
+      }
+      // A blank line between blocks keeps the path alive; anything else ends it.
+      if (!line || !line.trim()) {
+        passthrough.push(line)
+        continue
+      }
+      currentPath = null
+    }
+    // Single-line shape.
+    const s = line.match(SEARCH_ROW_RE)
+    if (s && addRow(s[1], s[2], s[3])) continue
+    // Candidate DSH path line. The heuristic (drive letter, separator, or
+    // dotted filename) stops prose like "note\nLine 42: …" from mis-grouping.
+    if (line && line.trim() && !DSH_SEARCH_LINE_RE.test(line) && isPathLike(line)) {
+      currentPath = line
+      continue
+    }
+    passthrough.push(line)
   }
   if (groups.size === 0) return text
   for (const path of order) {
@@ -237,13 +268,13 @@ function compactOutput(toolName, text, config, commandHint) {
   const cmd = typeof commandHint === 'string' ? commandHint : ''
   let out = text
   if (oc.stripAnsi) out = stripAnsi(out)
-  if (oc.compactGitOutput && toolName === 'bash' && /git (status|log|diff|show)\b/.test(cmd)) {
+  if (oc.compactGitOutput && (toolName === 'bash' || toolName === 'pwsh') && /git (status|log|diff|show)\b/.test(cmd)) {
     out = compactGitOutput(out)
   }
-  if (oc.aggregateTestOutput && toolName === 'bash' && /(jest|mocha|vitest|go test|pytest|npm test|npx t|pnpm test|gradle test|mvn test)\b/i.test(cmd)) {
+  if (oc.aggregateTestOutput && (toolName === 'bash' || toolName === 'pwsh') && /(jest|mocha|vitest|go test|pytest|npm test|npx t|pnpm test|gradle test|mvn test)\b/i.test(cmd)) {
     out = aggregateTestOutput(out)
   }
-  if (oc.filterBuildOutput && toolName === 'bash' && /\b(build|compile|tsc|make|gcc|clang|go build|npm (run )?(build|install)|pnpm (build|install))\b/i.test(cmd)) {
+  if (oc.filterBuildOutput && (toolName === 'bash' || toolName === 'pwsh') && /\b(build|compile|tsc|make|gcc|clang|go build|npm (run )?(build|install)|pnpm (build|install))\b/i.test(cmd)) {
     out = filterBuildOutput(out)
   }
   if (oc.groupSearchOutput && toolName === 'grep') {
@@ -278,7 +309,7 @@ const rtkCore = {
 // ============================================================================
 // Plugin
 // ============================================================================
-const COMPACT_TOOL_NAMES = new Set(['bash', 'grep', 'read'])
+const COMPACT_TOOL_NAMES = new Set(['bash', 'grep', 'read', 'pwsh'])
 const RTK_MISSING_TTL_MS = 60000
 // Upper bound on per-call bookkeeping maps (suggestions, hookPlan,
 // hookExecuted) so a call that plans but never resolves cannot leak memory.
@@ -676,7 +707,7 @@ return {
         const textBlock = blocks.find((b) => b && b.type === 'text' && typeof b.text === 'string')
         if (textBlock) {
           const original = textBlock.text
-          const commandHint = exec.name === 'bash' && exec.arguments && typeof exec.arguments.command === 'string'
+          const commandHint = (exec.name === 'bash' || exec.name === 'pwsh') && exec.arguments && typeof exec.arguments.command === 'string'
             ? exec.arguments.command
             : undefined
           const out = compactOutput(exec.name, original, config, commandHint)
