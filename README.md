@@ -48,6 +48,18 @@ RTK 命令改写建议 + 工具输出压缩——DSH 插件（Host 拦截器）�
 
 统计每个调用的节省字符数，`/rtk stats` 可查。
 
+### PTC（`run_code`）模式
+
+PTC 模式下模型不直接调用 `bash`，而是在 `run_code` 程序里调用 `tools.bash(...)`；程序拿到的是工具的 **`value`**（`{kind, stdout, stderr, …}`），不是渲染后的 content 块。插件为此做了三件事：
+
+- **压缩写回 value**：`tools/post-execute` 优先改写 bash value 的 `stdout`/`stderr` 文本（按 `maxOutputChars` 截断并带标记），由工具注册表据 value 重新渲染 content —— PTC 程序里看到的输出与普通模式一致，不会再拿到几万字符的原始串。
+- **hook 引擎失败时回退**：`rtk hook claude` 非零退出 / 超时 / 输出非 JSON 时，改用 `rtk rewrite <cmd>` 再试一次，避免静默放行；空 stdout + exit 0 是 rtk 的“无改写建议”语义，不会多跑一次。
+- **cwd 兜底**：PTC 嵌套调用可能不带 agent 会话头，取目录顺序为 `agent 会话头 → bash 参数的 workdir → 本进程最近一次见到的 cwd`；仍取不到才按原样执行（不会猜目录）。
+- **执行走对了 seam**：hook 模式用 `ctx.shell.execute(spec)` → `handle.result()`（兼容只有 `run(spec)` 的部署）。此前误用 `shell.run`，异常被吞，改写从未真正执行。
+- **`/rtk trace`**：打印最近 20 次决策（stage / cwd / hook 引擎回答 / 改写结果），定位"为什么没改写"不用再翻服务端日志。
+
+> `accept` 决策不能同时带 value 与 content。需要附加提示（suggest 模式的改写注记、debug 的 executed-as 注记）时提示优先，value 保持原样。
+
 ### 3. `/rtk` 命令
 
 `/rtk [show|verify|stats|clear-stats|reset|set|help]`——配置与运行状态、rtk 二进制探测、压缩节省量统计。

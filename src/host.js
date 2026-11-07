@@ -256,6 +256,38 @@ function compactOutput(toolName, text, config, commandHint) {
   return { text: truncated.text, savedChars: countSaved(text, truncated.text), truncated: truncated.truncated }
 }
 
+/**
+ * Compact a bash tool VALUE for PTC (`run_code`) callers.
+ *
+ * PTC programs resolve the tool's canonical `value` (`{kind, stdout, …}`), not
+ * the rendered content blocks, so a content-only post-execute decision stays
+ * invisible to them. Rewriting the value's own stdout/stderr keeps both
+ * surfaces identical: the registry re-renders content from the value we return.
+ * Returns undefined when the value carries no text to compact.
+ */
+function compactBashValue(result, config, commandHint) {
+  const value = result && result.value
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  if (value.kind !== 'foreground' && value.kind !== 'promoted') return undefined
+  const stdout = value.stdout
+  if (stdout === null || typeof stdout !== 'object' || typeof stdout.text !== 'string') return undefined
+  const out = compactOutput('bash', stdout.text, config, commandHint)
+  const stderr = value.stderr
+  let stderrText
+  if (config.outputCompaction.stripAnsi && stderr !== null && typeof stderr === 'object' && typeof stderr.text === 'string') {
+    const stripped = stripAnsi(stderr.text)
+    if (stripped !== stderr.text) stderrText = stripped
+  }
+  if (out.text === stdout.text && stderrText === undefined) return undefined
+  const next = {
+    ...value,
+    stdout: { ...stdout, text: out.text, ...(out.truncated ? { truncated: true } : {}) }
+  }
+  if (stderrText !== undefined) next.stderr = { ...stderr, text: stderrText }
+  const stderrSaved = stderrText !== undefined ? stderr.text.length - stderrText.length : 0
+  return { value: next, savedChars: out.savedChars + stderrSaved }
+}
+
 /** Conservative read compaction: collapse runs of blank lines only. */
 function compactReadOutput(text) {
   return text.replace(/\n{3,}/g, '\n\n')
@@ -271,6 +303,7 @@ const rtkCore = {
   truncateText,
   compactReadOutput,
   compactOutput,
+  compactBashValue,
   countSaved
 }
 //PURE-CORE-END
@@ -333,14 +366,84 @@ return {
       suggestions: new Map(), // callId → rewritten command (suggest mode)
       denyGuard: new Map(), // command → last deny ts (anti-loop)
       hookPlan: new Map(), // callId → rewritten command (hook mode)
-      hookExecuted: new Map() // callId → rewritten command actually executed (for post-execute note)
+      hookExecuted: new Map(), // callId → rewritten command actually executed (for post-execute note)
+      lastCwd: undefined, // last cwd seen for any execution (PTC nested calls may omit it)
+      trace: [] // last pre-execute decisions, for /rtk trace
     }
 
-    function sessionCwd(exec) {
-      return exec.agent && exec.agent.session && exec.agent.session.header
-        ? exec.agent.session.header.cwd
-        : undefined
+    /** Record one pre-execute decision (bounded ring) for /rtk trace. */
+    function pushTrace(command, cwd, hookInfo, rewritten, stage) {
+      const hook = hookInfo === undefined
+        ? '-'
+        : (hookInfo.ok ? 'ok' : 'fail') +
+          (hookInfo.exit !== undefined ? `/exit=${hookInfo.exit}` : '') +
+          (hookInfo.error !== undefined ? `/err=${String(hookInfo.error).slice(0, 140)}` : '') +
+          (hookInfo.bytes !== undefined ? `/bytes=${hookInfo.bytes}` : '') +
+          (hookInfo.command === undefined ? '' : '/rewrote')
+      state.trace.push({
+        at: Date.now(),
+        stage: stage ?? '-',
+        cmd: String(command).slice(0, 100),
+        cwd: cwd ?? null,
+        hook,
+        rewritten: rewritten ?? null
+      })
+      if (state.trace.length > 20) state.trace.shift()
     }
+
+    /**
+     * Working directory for an rtk spawn and for a hook-mode rewrite. Direct
+     * calls carry it on the agent session header; PTC (`run_code`) nested calls
+     * may arrive without one, so fall back to the bash tool's own `workdir`,
+     * then to the most recent cwd observed in this process. Returning undefined
+     * still degrades to pass-through — never to a guessed directory.
+     */
+    function sessionCwd(exec) {
+      const header = exec.agent && exec.agent.session && exec.agent.session.header
+      const headerCwd = header && typeof header.cwd === 'string' && header.cwd.length > 0
+        ? header.cwd
+        : undefined
+      if (headerCwd !== undefined) {
+        state.lastCwd = headerCwd
+        return headerCwd
+      }
+      const workdir = exec.arguments && typeof exec.arguments.workdir === 'string' && exec.arguments.workdir.length > 0
+        ? exec.arguments.workdir
+        : undefined
+      if (workdir !== undefined) {
+        state.lastCwd = workdir
+        return workdir
+      }
+      return state.lastCwd
+    }
+    /**
+     * Resolve the bash call's own `workdir` argument the way the tool does: an
+     * absolute path wins, a relative one is joined to the session cwd. Without
+     * it a rewritten command ran in the session root instead of the requested
+     * directory (`git status` on a sub-repo failed with exit 128).
+     */
+    function resolveWorkdirArg(exec, cwd) {
+      const arg = exec.arguments && typeof exec.arguments.workdir === 'string' ? exec.arguments.workdir.trim() : ''
+      if (arg.length === 0) return cwd
+      const absolute = /^[A-Za-z]:[\\/]/.test(arg) || arg.startsWith('/') || arg.startsWith('\\\\')
+      return absolute ? arg : `${cwd}/${arg}`
+    }
+
+    /**
+     * Run a resolved shell spec. DSH's seam is `execute(spec)` → handle →
+     * `result()`; some deployments expose a plain `run(spec)`. Supporting both
+     * matters: calling a missing `run` threw inside the execute hook and made
+     * hook mode fall back to the original command on every call.
+     */
+    async function runShell(spec) {
+      if (shell !== undefined && typeof shell.execute === 'function') {
+        const handle = await shell.execute(spec)
+        return await handle.result()
+      }
+      if (shell !== undefined && typeof shell.run === 'function') return await shell.run(spec)
+      throw new Error('rtk-optimizer: the shell service exposes neither execute() nor run()')
+    }
+
     function cfg() {
       return config
     }
@@ -529,26 +632,30 @@ return {
         }
         if (!outcome || outcome.exitCode !== 0) {
           if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook exit=${outcome ? outcome.exitCode : 'timeout'}`)
-          return undefined
+          return { ok: false, exit: outcome ? outcome.exitCode : 'timeout', bytes: 0 }
         }
         const reader = handle.collected && handle.collected.stdout
         const text = reader ? (await reader.readFrom(0)).text : ''
-        if (!text) return undefined
+        // `rtk hook` always prints a JSON decision when it understood the input,
+        // so an empty stdout is a silent engine (e.g. stdin not delivered) — the
+        // caller retries with `rtk rewrite` instead of treating it as "no rewrite".
+        if (!text) return { ok: true, bytes: 0 }
         let parsed
         try {
           parsed = JSON.parse(text)
         } catch (e) {
           if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook output not JSON: ${errText(e)}`)
-          return undefined
+          return { ok: false, bytes: text.length }
         }
         const rewritten = parsed && parsed.hookSpecificOutput && parsed.hookSpecificOutput.updatedInput
           ? parsed.hookSpecificOutput.updatedInput.command
           : undefined
         if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook of "${command}" → "${rewritten}"`)
-        return typeof rewritten === 'string' && rewritten.length > 0 && rewritten !== command ? rewritten : undefined
+        if (typeof rewritten !== 'string' || rewritten.length === 0 || rewritten === command) return { ok: true, bytes: text.length }
+        return { ok: true, command: rewritten, bytes: text.length }
       } catch (e) {
         if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook threw: ${errText(e)}`)
-        return undefined
+        return { ok: false, error: errText(e), bytes: 0 }
       }
     }
 
@@ -558,11 +665,18 @@ return {
       const command = exec.arguments && typeof exec.arguments.command === 'string'
         ? exec.arguments.command
         : undefined
-      if (!command) return next()
+      if (!command) {
+        pushTrace('(no command)', undefined, undefined, undefined, 'no-command')
+        return next()
+      }
       const cwd = sessionCwd(exec)
-      if (cwd === undefined) return next()
+      if (cwd === undefined) {
+        pushTrace(command, undefined, undefined, undefined, 'no-cwd')
+        return next()
+      }
       const exe = await resolveRtk(exec.signal)
       if (exe === undefined) {
+        pushTrace(command, cwd, undefined, undefined, 'rtk-missing')
         if (!config.guardWhenRtkMissing) {
           return { kind: 'deny', reason: 'rtk-optimizer: the rtk binary is not available; this command was not rewritten. Install rtk or set guardWhenRtkMissing=false.' }
         }
@@ -572,9 +686,23 @@ return {
         }
         return next()
       }
-      const rewritten = config.mode === 'hook'
-        ? await rtkHookRewrite(exe, cwd, command, exec.signal)
-        : await rtkRewrite(exe, cwd, command, exec.signal)
+      // Hook mode prefers the agent-hook engine. When that engine fails
+      // (non-zero exit, timeout, unparseable output — e.g. inside a PTC
+      // `run_code` nested dispatch) fall back to the plain rewriter instead of
+      // silently running the command unchanged.
+      let rewritten
+      let hookInfo
+      if (config.mode === 'hook') {
+        hookInfo = await rtkHookRewrite(exe, cwd, command, exec.signal)
+        // A silent hook engine (empty stdout on exit 0) is retried through the
+        // plain rewriter as well — it always answers JSON when it understood
+        // the input, so silence means the engine never saw the command.
+        const silent = hookInfo.ok === true && hookInfo.command === undefined
+        rewritten = hookInfo.ok && !silent ? hookInfo.command : await rtkRewrite(exe, cwd, command, exec.signal)
+      } else {
+        rewritten = await rtkRewrite(exe, cwd, command, exec.signal)
+      }
+      pushTrace(command, cwd, hookInfo, rewritten, rewritten === undefined ? 'no-rewrite' : 'planned')
       if (rewritten === undefined) {
         if (config.debug && !state.rewriteFailureNoted) {
           state.rewriteFailureNoted = true
@@ -610,11 +738,32 @@ return {
     // ── tools/execute: hook mode replaces execution with `rtk <cmd>` ──
     ctx.on('tools/execute', async (exec, next) => {
       if (!config.enabled || config.mode !== 'hook' || exec.name !== 'bash') return next()
-      const rewritten = state.hookPlan.get(exec.callId)
-      if (rewritten === undefined) return next()
-      state.hookPlan.delete(exec.callId)
       const cwd = sessionCwd(exec)
       if (cwd === undefined) return next()
+      const runCwd = resolveWorkdirArg(exec, cwd)
+      const command = exec.arguments && typeof exec.arguments.command === 'string'
+        ? exec.arguments.command
+        : undefined
+      const planFound = state.hookPlan.has(exec.callId)
+      pushTrace(command ?? '(none)', cwd, { ok: true, error: planFound ? 'plan' : 'no-plan' }, undefined, 'execute-enter')
+      let rewritten = state.hookPlan.get(exec.callId)
+      state.hookPlan.delete(exec.callId)
+      if (rewritten === undefined) {
+        // PTC (`run_code`) nested dispatches do not reliably reach the
+        // pre-execute waterfall, but every dispatch does run through
+        // `tools/execute` — so hook mode rewrites here when no plan exists.
+        if (command === undefined) return next()
+        const exe = await resolveRtk(exec.signal)
+        if (exe === undefined) {
+          pushTrace(command, cwd, undefined, undefined, 'rtk-missing@execute')
+          return next()
+        }
+        const hookInfo = await rtkHookRewrite(exe, cwd, command, exec.signal)
+        const silent = hookInfo.ok === true && hookInfo.command === undefined
+        rewritten = hookInfo.ok && !silent ? hookInfo.command : await rtkRewrite(exe, cwd, command, exec.signal)
+        pushTrace(command, cwd, hookInfo, rewritten, rewritten === undefined ? 'no-rewrite@execute' : 'planned@execute')
+        if (rewritten === undefined) return next()
+      }
       const timeoutMs = exec.arguments && Number.isFinite(exec.arguments.timeoutMs) && exec.arguments.timeoutMs > 0
         ? exec.arguments.timeoutMs
         : 120000
@@ -631,16 +780,21 @@ return {
           : undefined
         const spec = shell.resolve({
           command: rewritten,
-          workdir: cwd,
+          workdir: runCwd,
           timeoutMs,
           ...(policy !== undefined ? { sandboxPolicy: policy } : {}),
           signal: exec.signal
         })
-        const outcome = await shell.run(spec)
+        const outcome = await runShell(spec)
+        pushTrace(command ?? '(none)', cwd, { ok: true, bytes: 0, error: 'ran' }, rewritten, 'execute-ran')
         state.hookExecuted.set(exec.callId, rewritten)
         capMap(state.hookExecuted)
+        // Mirror the bash tool's canonical foreground value exactly: the output
+        // schema is `additionalProperties: false` and `cwd` is required, so a
+        // missing field makes the registry reject the whole call.
         const value = {
           kind: 'foreground',
+          cwd: spec.workdir ?? runCwd,
           exitCode: outcome.exitCode,
           signal: outcome.signal,
           timedOut: outcome.timedOut,
@@ -660,6 +814,7 @@ return {
         return { value }
       } catch (e) {
         if (config.debug) console.error(`dsh-rtk-optimizer: hook execute threw: ${errText(e)}`)
+        pushTrace(command ?? '(none)', cwd, { ok: false, error: errText(e) }, rewritten, 'execute-threw')
         return next()
       }
     })
@@ -670,19 +825,29 @@ return {
       state.suggestions.delete(exec.callId)
 
       let compactedBlocks
+      let compactedValue
       let savedChars = 0
+      let blockSavedChars = 0
       if (config.enabled && config.outputCompaction.enabled && !result.isError && COMPACT_TOOL_NAMES.has(exec.name)) {
-        const blocks = result.content
-        const textBlock = blocks.find((b) => b && b.type === 'text' && typeof b.text === 'string')
-        if (textBlock) {
-          const original = textBlock.text
-          const commandHint = exec.name === 'bash' && exec.arguments && typeof exec.arguments.command === 'string'
-            ? exec.arguments.command
-            : undefined
-          const out = compactOutput(exec.name, original, config, commandHint)
-          if (out.text !== original) {
-            compactedBlocks = blocks.map((b) => (b === textBlock ? { type: 'text', text: out.text } : b))
-            savedChars = out.savedChars
+        const commandHint = exec.name === 'bash' && exec.arguments && typeof exec.arguments.command === 'string'
+          ? exec.arguments.command
+          : undefined
+        // PTC (`run_code`) programs resolve the tool VALUE, so compact it first;
+        // the registry then re-renders the content blocks from what we return.
+        const valuePatch = exec.name === 'bash' ? compactBashValue(result, config, commandHint) : undefined
+        if (valuePatch !== undefined) {
+          compactedValue = valuePatch.value
+          savedChars = valuePatch.savedChars
+        } else {
+          const blocks = Array.isArray(result.content) ? result.content : []
+          const textBlock = blocks.find((b) => b && b.type === 'text' && typeof b.text === 'string')
+          if (textBlock) {
+            const original = textBlock.text
+            const out = compactOutput(exec.name, original, config, commandHint)
+            if (out.text !== original) {
+              compactedBlocks = blocks.map((b) => (b === textBlock ? { type: 'text', text: out.text } : b))
+              blockSavedChars = out.savedChars
+            }
           }
         }
       }
@@ -696,6 +861,10 @@ return {
         const existing = blocks.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.includes('[rtk-optimizer]'))
         if (!existing) {
           compactedBlocks = [...(compactedBlocks ?? blocks), { type: 'text', text: note }]
+          // One accept decision cannot carry both value and content; the
+          // user-facing note wins over the value rewrite.
+          compactedValue = undefined
+          savedChars = blockSavedChars
         }
       }
 
@@ -712,10 +881,12 @@ return {
         const existing = blocks.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.includes('[rtk-optimizer]'))
         if (!existing) {
           compactedBlocks = [{ type: 'text', text: note }, ...(compactedBlocks ?? blocks)]
+          compactedValue = undefined
+          savedChars = blockSavedChars
         }
       }
 
-      if (compactedBlocks === undefined) return next()
+      if (compactedValue === undefined && compactedBlocks === undefined) return next()
 
       state.stats.calls += 1
       if (savedChars > 0) {
@@ -723,7 +894,9 @@ return {
         state.stats.savedChars += savedChars
         state.stats.byTool[exec.name] = (state.stats.byTool[exec.name] ?? 0) + savedChars
       }
-      return { kind: 'accept', content: compactedBlocks }
+      return compactedValue !== undefined
+        ? { kind: 'accept', value: compactedValue }
+        : { kind: 'accept', content: compactedBlocks }
     })
 
     // ── /rtk command ──
@@ -731,7 +904,7 @@ return {
       commands.register({
         name: 'rtk',
         description: 'RTK optimizer status: show config, verify the rtk binary, or show compaction stats.',
-        input: { hint: 'show | verify | stats | clear-stats | reset | help' },
+        input: { hint: 'show | verify | stats | trace | clear-stats | reset | help' },
         handler: async (invocation) => {
           const line = invocation.rawInput.trim()
           try {
@@ -817,11 +990,21 @@ return {
                 const persisted = await persistConfig(changes)
                 return { kind: 'success', text: `rtk-optimizer config reset to defaults.${persisted ? '' : ' (not persisted)'}` }
               }
+              case 'trace': {
+                if (state.trace.length === 0) {
+                  return { kind: 'success', text: 'rtk-optimizer: no pre-execute decisions recorded yet' }
+                }
+                const lines = state.trace.map((e) => {
+                  const time = new Date(e.at).toISOString().slice(11, 19)
+                  return `${time} [${e.stage}] cwd=${e.cwd ?? '(none)'} hook=${e.hook} → ${e.rewritten ?? '(no rewrite)'}  ::  ${e.cmd}`
+                })
+                return { kind: 'success', text: ['rtk-optimizer pre-execute trace (oldest first):', ...lines].join('\n') }
+              }
               case 'help':
               case '': {
                 return {
                   kind: 'success',
-                  text: 'rtk-optimizer: /rtk [show|verify|stats|clear-stats|reset|set|help]\n  show        current configuration and runtime status\n  verify      check whether the rtk binary is available\n  stats       compaction savings for this process\n  clear-stats reset the counters\n  set         /rtk set <key> <value> (mode(suggest|rewrite|hook)|enabled|guardWhenRtkMissing|readCompaction)\n  reset       restore default configuration'
+                  text: 'rtk-optimizer: /rtk [show|verify|stats|trace|clear-stats|reset|set|help]\n  show        current configuration and runtime status\n  verify      check whether the rtk binary is available\n  stats       compaction savings for this process\n  trace       last pre-execute decisions (command, cwd, hook engine answer)\n  clear-stats reset the counters\n  set         /rtk set <key> <value> (mode(suggest|rewrite|hook)|enabled|guardWhenRtkMissing|readCompaction)\n  reset       restore default configuration'
                 }
               }
               default:

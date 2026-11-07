@@ -27,6 +27,25 @@ function mount(opts = {}) {
   // live. The fake records every resolved spec so tests can assert the rewrite
   // reached the executor and carried the resolved policy.
   const shellLog = []
+  // DSH's seam is `execute(spec)` → handle → `result()`; a `run(spec)`-only
+  // deployment is covered by opts.shellApi === 'run'.
+  const shellOutcome = async (spec) => {
+    shellLog.push({ spec })
+    const r = typeof opts.shellResult === 'function' ? opts.shellResult(spec) : opts.shellResult
+    if (r && typeof r.then === 'function') return r
+    // `??` would swallow a deliberate `exitCode: null` / custom signal that a
+    // timeout case sets, so presence is tested instead of nullishness.
+    return {
+      exitCode: r && 'exitCode' in r ? r.exitCode : 0,
+      signal: r && 'signal' in r ? r.signal : null,
+      timedOut: r?.timedOut ?? false,
+      aborted: r?.aborted ?? false,
+      timeoutMs: (r && 'timeoutMs' in r ? r.timeoutMs : undefined) ?? spec.timeoutMs ?? 120000,
+      stdout: { text: r?.stdout ?? '', truncated: false, ...(r?.stdoutSpill !== undefined ? { spillPath: r.stdoutSpill } : {}) },
+      stderr: { text: r?.stderr ?? '', truncated: false, ...(r?.stderrSpill !== undefined ? { spillPath: r.stderrSpill } : {}) },
+      ...(r?.sandbox !== undefined ? { sandbox: r.sandbox } : {})
+    }
+  }
   const fakeShell = {
     resolve: (request) => ({
       command: request.command,
@@ -35,23 +54,11 @@ function mount(opts = {}) {
       ...(request.sandboxPolicy !== undefined ? { sandboxPolicy: request.sandboxPolicy } : {}),
       signal: request.signal
     }),
-    run: async (spec) => {
-      shellLog.push({ spec })
-      const r = typeof opts.shellResult === 'function' ? opts.shellResult(spec) : opts.shellResult
-      if (r && typeof r.then === 'function') return r
-      // `??` would swallow a deliberate `exitCode: null` / custom signal that a
-      // timeout case sets, so presence is tested instead of nullishness.
-      return {
-        exitCode: r && 'exitCode' in r ? r.exitCode : 0,
-        signal: r && 'signal' in r ? r.signal : null,
-        timedOut: r?.timedOut ?? false,
-        aborted: r?.aborted ?? false,
-        timeoutMs: (r && 'timeoutMs' in r ? r.timeoutMs : undefined) ?? spec.timeoutMs ?? 120000,
-        stdout: { text: r?.stdout ?? '', truncated: false, ...(r?.stdoutSpill !== undefined ? { spillPath: r.stdoutSpill } : {}) },
-        stderr: { text: r?.stderr ?? '', truncated: false, ...(r?.stderrSpill !== undefined ? { spillPath: r.stderrSpill } : {}) },
-        ...(r?.sandbox !== undefined ? { sandbox: r.sandbox } : {})
-      }
-    }
+    execute: async (spec) => ({ result: () => shellOutcome(spec) })
+  }
+  if (opts.shellApi === 'run') {
+    delete fakeShell.execute
+    fakeShell.run = shellOutcome
   }
   const fakeSpawn = (spec) => {
     spawnLog.push({ spec })
@@ -202,15 +209,71 @@ test('hook mode pre-execute spawns `rtk hook claude` with PreToolUse JSON stdin 
   assert.equal(payload.tool_input.command, 'ls -la')
 })
 
-test('hook mode pre-execute plans nothing when rtk hook returns no rewrite (empty stdout)', async () => {
+test('hook mode pre-execute retries a silent hook engine through rtk rewrite', async () => {
   const spawnLog = []
   const t = mount({ spawnLog, spawnResult: { outcome: { exitCode: 0, signal: null }, stdout: '' } })
   await t.runCommand('set mode hook')
   const { nextCalled } = await pre(t, 'call-2', 'echo hi')
   assert.equal(nextCalled, true)
-  assert.equal(spawnLog.length, 1, 'hook was consulted once')
-  // second pre-execute must not spawn again for the same call after execute consumed the plan:
-  // (execute consumption is Task 3; here we only assert pre-execute allows)
+  // A silent hook engine is suspicious (it always prints JSON when it saw the
+  // command), so one rtk rewrite retry follows; both silent means run as-is.
+  assert.equal(spawnLog.length, 2, 'hook engine + rewrite retry')
+  assert.equal(spawnLog[0].spec.argv[1], 'hook')
+  assert.equal(spawnLog[1].spec.argv[1], 'rewrite')
+})
+
+test('/rtk trace reports the last pre-execute decision', async () => {
+  const t = mount({
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls -la' } } })
+    }
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-trace', 'ls -la')
+  const out = await t.runCommand('trace')
+  assert.equal(out.kind, 'success')
+  assert.match(out.text, /pre-execute trace/)
+  assert.match(out.text, /ls -la/)
+  assert.match(out.text, /rtk ls -la/)
+})
+
+test('hook mode pre-execute falls back to rtk rewrite when the hook engine fails', async () => {
+  const spawnLog = []
+  const t = mount({
+    spawnLog,
+    spawnResult: (spec) => {
+      if (spec.argv[1] === 'hook') return { outcome: { exitCode: 1, signal: null }, stdout: '' }
+      return { outcome: { exitCode: 3, signal: null }, stdout: 'rtk ls -la\n' }
+    }
+  })
+  await t.runCommand('set mode hook')
+  const { out, nextCalled } = await pre(t, 'call-fallback', 'ls -la')
+  assert.equal(nextCalled, true, 'the call must still be allowed')
+  assert.equal(out.kind, 'next')
+  assert.equal(spawnLog.length, 2, 'hook engine then rewrite fallback')
+  assert.equal(spawnLog[1].spec.argv[1], 'rewrite')
+  // the fallback rewrite is planned, so execute now short-circuits to rtk ls -la
+  await exec(t, 'call-fallback', 'ls -la')
+  assert.equal(t.shellLog.length, 1)
+  assert.equal(t.shellLog[0].spec.command, 'rtk ls -la')
+})
+
+test('hook mode executes through run(spec) when the seam has no execute()', async () => {
+  const t = mount({
+    shellApi: 'run',
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls -la' } } })
+    },
+    shellResult: { exitCode: 0, stdout: 'file1\n' }
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-run-seam', 'ls -la')
+  const { out, nextCalled } = await exec(t, 'call-run-seam', 'ls -la')
+  assert.equal(nextCalled, false, 'the rewrite must still execute')
+  assert.equal(out.value.stdout.text, 'file1\n')
+  assert.equal(t.shellLog[0].spec.command, 'rtk ls -la')
 })
 
 test('hook mode pre-execute allows when rtk binary is missing', async () => {
@@ -243,11 +306,38 @@ test('hook mode execute short-circuits with a foreground value running the rewri
   assert.equal(value.kind, 'foreground')
   assert.equal(value.exitCode, 0)
   assert.equal(value.stdout.text, 'file1\nfile2\n')
+  // The bash output schema is additionalProperties:false and requires `cwd`;
+  // missing it made the registry reject the whole call ("must match exactly
+  // one oneOf branch").
+  assert.equal(value.cwd, '/home/yjw/workspace/dsh-rtk-optimizer')
+  assert.deepEqual(Object.keys(value).sort(), [
+    'aborted', 'cwd', 'exitCode', 'kind', 'signal', 'stderr', 'stdout', 'timedOut', 'timeoutMs'
+  ])
   // the rewritten command goes through the shell seam, not a spawn of its own
   assert.equal(t.shellLog.length, 1, 'exactly one shell.run for the rewritten command')
   assert.equal(t.shellLog[0].spec.command, 'rtk ls -la')
   assert.equal(spawnLog.length, 1, 'the only subprocess spawn is `rtk hook claude`')
   assert.equal(spawnLog[0].spec.argv[1], 'hook')
+})
+
+test('hook mode runs the rewrite in the call workdir, not the session root', async () => {
+  const t = mount({
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk git status --short' } } })
+    },
+    shellResult: { exitCode: 0, stdout: '' }
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-wd', 'git status --short', { workdir: '/repo/sub' })
+  const { out } = await exec(t, 'call-wd', 'git status --short', { workdir: '/repo/sub' })
+  assert.equal(t.shellLog[0].spec.workdir, '/repo/sub', 'absolute workdir must win over the session cwd')
+  assert.equal(out.value.cwd, '/repo/sub', 'value.cwd must match the directory actually used')
+
+  // A relative workdir is joined to the session cwd, like the bash tool does.
+  await pre(t, 'call-wd-2', 'git status --short', { workdir: 'nested' })
+  await exec(t, 'call-wd-2', 'git status --short', { workdir: 'nested' })
+  assert.equal(t.shellLog[1].spec.workdir, '/home/yjw/workspace/dsh-rtk-optimizer/nested')
 })
 
 test('hook mode execute resolves and forwards the session sandbox policy to the shell seam', async () => {
@@ -295,14 +385,18 @@ test('hook mode execute passes through the executor sandbox verdict', async () =
   assert.deepEqual(out.value.sandbox, { mode: 'workspace-write', denied: true, enforcement: 'partial' })
 })
 
-test('hook mode execute falls through to next() when no plan exists', async () => {
+test('hook mode execute recomputes the rewrite when pre-execute planned nothing', async () => {
   const spawnLog = []
   const t = mount({ spawnLog })
   await t.runCommand('set mode hook')
   const { out, nextCalled } = await exec(t, 'call-no-plan', 'ls')
-  assert.equal(nextCalled, true)
+  assert.equal(nextCalled, true, 'both engines silent → run the original command')
   assert.equal(out.kind, 'next')
-  assert.equal(spawnLog.length, 0, 'no spawn when no plan')
+  // PTC nested dispatches may skip pre-execute entirely, so execute asks the
+  // engines itself: one hook call plus one silent-engine rewrite retry.
+  assert.equal(spawnLog.length, 2, 'execute consults hook + rewrite')
+  assert.equal(spawnLog[0].spec.argv[1], 'hook')
+  assert.equal(spawnLog[1].spec.argv[1], 'rewrite')
 })
 
 test('hook mode execute falls through to next() when the shell seam rejects', async () => {
@@ -411,14 +505,17 @@ test('hook mode bounded maps: hookPlan evicts oldest beyond 64 distinct plans', 
     const { nextCalled } = await pre(t, `call-cap-${i}`, `echo ${i}`)
     assert.equal(nextCalled, true, `pre must allow call-cap-${i}`)
   }
-  // The oldest plan was evicted → execute falls through to next() (no plan).
+  // The oldest plan was evicted, but execute recomputes the rewrite itself, so
+  // the call still gets optimized instead of silently running unchanged.
   const oldestFirst = await exec(t, 'call-cap-0', 'echo 0')
-  assert.equal(oldestFirst.nextCalled, true, 'oldest plan must be evicted by the cap')
-  assert.equal(oldestFirst.out.kind, 'next')
-  // A more recent plan survives → execute short-circuits.
+  assert.equal(oldestFirst.nextCalled, false, 'evicted plan is recomputed at execute')
+  assert.equal(oldestFirst.out.value.kind, 'foreground')
+  // A surviving plan short-circuits without any further engine calls.
+  const spawnsBefore = t.spawnLog.length
   const newest = await exec(t, 'call-cap-63', 'echo 63')
   assert.equal(newest.nextCalled, false, 'a plan within the cap must survive')
   assert.equal(newest.out.value.kind, 'foreground')
+  assert.equal(t.spawnLog.length, spawnsBefore, 'a live plan is reused without re-probing')
 })
 
 test('hook mode bounded maps: hookExecuted evicts oldest beyond 64 so its post-execute note is dropped', async () => {
@@ -472,9 +569,11 @@ test('hook mode post-execute clears a planned-but-not-executed hookPlan entry', 
   assert.equal(nextCalled, true, 'post-execute itself has nothing to do')
   // The plan was cleaned: re-running pre must re-plan (proving no stale entry)
   // and, more directly, execute must fall through (plan was removed).
+  const spawnsBefore = t.spawnLog.length
   const { out, nextCalled: execNC } = await exec(t, 'call-cleaned', 'echo hi')
-  assert.equal(execNC, true, 'planned-but-not-executed entry cleaned by post-execute')
-  assert.equal(out.kind, 'next')
+  assert.equal(execNC, false, 'cleaned plan is recomputed at execute time')
+  assert.equal(out.value.kind, 'foreground')
+  assert.ok(t.spawnLog.length > spawnsBefore, 'no stale plan was reused; the engines were asked again')
 })
 
 // ── Final review fixes: F2 (spillPath propagation) ──────────────────────────
@@ -564,4 +663,97 @@ test('persist failure degrades to in-memory-only (success response with not pers
   const out = await t.runCommand('set mode hook')
   assert.equal(out.kind, 'success')
   assert.ok(out.text.includes('(not persisted)'), 'command still succeeds, warns not persisted')
+})
+
+// ── PTC (run_code): programs resolve the tool VALUE, not content blocks ──────
+
+test('post-execute compacts the bash value so PTC programs see the trimmed output', async () => {
+  const t = mount()
+  const big = 'line\n'.repeat(8000)
+  const result = {
+    isError: false,
+    content: [{ type: 'text', text: big }],
+    value: {
+      kind: 'foreground',
+      cwd: '/repo',
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      aborted: false,
+      timeoutMs: 120000,
+      stdout: { text: big, truncated: false },
+      stderr: { text: '', truncated: false }
+    }
+  }
+  const { out, nextCalled } = await post(t, 'call-ptc-1', result)
+  assert.equal(nextCalled, false, 'compaction must be accepted')
+  assert.ok(out.value, 'PTC path must answer with a value')
+  assert.equal(out.content, undefined, 'value decision cannot also carry content')
+  assert.ok(out.value.stdout.text.length < big.length, 'value stdout must be compacted')
+  assert.match(out.value.stdout.text, /rtk-optimizer/, 'truncation marker must be visible in the value')
+  assert.equal(out.value.exitCode, 0, 'unrelated value fields must survive')
+})
+
+test('post-execute leaves a small bash value untouched (no empty decisions)', async () => {
+  const t = mount()
+  const result = {
+    isError: false,
+    content: [{ type: 'text', text: 'ok\n' }],
+    value: {
+      kind: 'foreground',
+      cwd: '/repo',
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      aborted: false,
+      timeoutMs: 120000,
+      stdout: { text: 'ok\n', truncated: false },
+      stderr: { text: '', truncated: false }
+    }
+  }
+  const { out, nextCalled } = await post(t, 'call-ptc-2', result)
+  assert.equal(nextCalled, true, 'nothing to compact → fall through')
+  assert.equal(out.kind, 'next')
+})
+
+test('PTC nested call without an agent header still plans a rewrite (workdir fallback)', async () => {
+  const spawnLog = []
+  const t = mount({
+    spawnLog,
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } })
+    }
+  })
+  await t.runCommand('set mode hook')
+  const execObj = {
+    callId: 'call-ptc-cwd',
+    name: 'bash',
+    signal: { aborted: false },
+    arguments: { command: 'ls', workdir: '/repo/sub' }
+  }
+  let nextCalled = false
+  const out = await t.handlers['tools/pre-execute'](execObj, () => { nextCalled = true; return { kind: 'next' } })
+  assert.equal(nextCalled, true, 'pre-execute must allow the call')
+  assert.equal(out.kind, 'next')
+  assert.equal(spawnLog.length, 1, 'rtk hook must still be consulted without an agent header')
+  assert.equal(spawnLog[0].spec.cwd, '/repo/sub', 'the bash workdir must be the fallback cwd')
+})
+
+test('PTC nested call reuses the last observed cwd when no header or workdir is present', async () => {
+  const spawnLog = []
+  const t = mount({
+    spawnLog,
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } })
+    }
+  })
+  await t.runCommand('set mode hook')
+  // First call carries a header and seeds the cache.
+  await pre(t, 'call-seed', 'ls')
+  const execObj = { callId: 'call-ptc-cwd-2', name: 'bash', signal: { aborted: false }, arguments: { command: 'ls' } }
+  await t.handlers['tools/pre-execute'](execObj, () => ({ kind: 'next' }))
+  assert.equal(spawnLog.length, 2)
+  assert.equal(spawnLog[1].spec.cwd, '/home/yjw/workspace/dsh-rtk-optimizer', 'cached cwd must be reused')
 })
